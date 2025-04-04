@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+interface IPancakeRouter {
+    function factory() external pure returns (address);
+    function WETH() external pure returns (address);
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
+
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+}
+
+interface IPancakeFactory {
+    function createPair(address tokenA, address tokenB) external returns (address);
+}
+
+contract NarraAI is ERC20, Ownable, ReentrancyGuard {
+    // Initial supply of 20 million tokens (18 decimals)
+    uint256 private constant INITIAL_SUPPLY = 20_000_000 * 1e18;
+
+    address public marketingWallet;
+    IPancakeRouter public router;
+    address public pair;
+
+    uint256 public marketingFee = 3; // 3% of every transfer goes to marketing
+    uint256 public lpFee = 3;        // 3% goes to the contract (for liquidity)
+    uint256 public swapThreshold = 1000 * 1e18; // Minimum token amount to trigger auto-liquidity
+
+    address public lpReceiver = address(0); // Address to receive LP tokens (set to burn by default)
+    
+    bool private inSwap;
+    
+    event MarketingWalletUpdated(address newWallet);
+    event LPReceiverUpdated(address newWallet);
+    event SwapThresholdUpdated(uint256 newThreshold);
+    event LiquidityAdded(uint256 tokenAmount, uint256 scaiAmount);
+    event FeesWithdrawn(address to, uint256 amount);
+    event StuckSCAIRecovered(address to, uint256 amount);
+
+    // Modifier to lock liquidity functions to avoid re-entrancy bugs
+    modifier lockTheSwap() {
+        inSwap = true;
+        _;
+        inSwap = false;
+    }
+
+    constructor(address _router) ERC20("Narra AI", "NARRA") Ownable(msg.sender) {
+        _mint(msg.sender, INITIAL_SUPPLY);
+
+        router = IPancakeRouter(_router);
+        pair = IPancakeFactory(router.factory()).createPair(address(this), router.WETH());
+
+        _approve(address(this), address(router), type(uint256).max);
+    }
+
+    receive() external payable {}
+
+    // Set the address that will receive LP tokens from liquidity addition
+    function setLPReceiver(address _receiver) external onlyOwner {
+        lpReceiver = _receiver;
+        emit LPReceiverUpdated(_receiver);
+    }
+
+    // Set the marketing wallet where marketing fees are sent
+    function setMarketingWallet(address _wallet) external onlyOwner {
+        require(_wallet != address(0), "Marketing wallet cannot be zero");
+        marketingWallet = _wallet;
+        emit MarketingWalletUpdated(_wallet);
+    }
+
+    // Adjust the token threshold that triggers auto-liquidity
+    function setSwapThreshold(uint256 _threshold) external onlyOwner {
+        swapThreshold = _threshold;
+        emit SwapThresholdUpdated(_threshold);
+    }
+
+    function _update(address from, address to, uint256 amount) internal override {
+        if (from == address(this) || marketingWallet == address(0)) {
+            super._update(from, to, amount);
+            return;
+        }
+
+        // Check if this is a BUY or SELL (to/from the liquidity pair)
+        bool isBuy = from == pair;
+        bool isSell = to == pair;
+
+        // Apply tax only on Buy or Sell
+        if ((isBuy || isSell) && !inSwap) {
+            if (isSell && balanceOf(address(this)) >= swapThreshold) {
+                swapAndLiquify(swapThreshold);
+            }
+
+            uint256 marketingPortion = (amount * marketingFee) / 100;
+            uint256 contractPortion = (amount * lpFee) / 100;
+            uint256 netAmount = amount - marketingPortion - contractPortion;
+
+            super._update(from, marketingWallet, marketingPortion);
+            super._update(from, address(this), contractPortion);
+            super._update(from, to, netAmount);
+        } else {
+            // Wallet-to-wallet transfer (no tax)
+            super._update(from, to, amount);
+        }
+    }
+
+    function swapAndLiquify(uint256 tokens) private lockTheSwap {
+        uint256 half = tokens / 2;
+        uint256 otherHalf = tokens - half;
+
+        uint256 initialBalance = address(this).balance;
+
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = router.WETH();
+
+        _approve(address(this), address(router), half);
+
+        // Swap half for SCAI
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            half,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 newSCAI = address(this).balance - initialBalance;
+
+        // Add liquidity to PancakeSwap
+        router.addLiquidityETH{value: newSCAI}(
+            address(this),
+            otherHalf,
+            0,
+            0,
+            lpReceiver,
+            block.timestamp
+        );
+
+        emit LiquidityAdded(otherHalf, newSCAI);
+    }
+
+    // Emergency function to recover any tokens accidentally stuck in the contract
+    function withdrawCollectedFees(address to, uint256 amount) external onlyOwner nonReentrant {
+        require(to != address(0), "Invalid recipient");
+        _transfer(address(this), to, amount);
+        emit FeesWithdrawn(to, amount);
+    }
+
+    // Emergency function to recover SCAI accidentally stuck in the contract
+    function rescueStuckSCAI(address payable to) external onlyOwner nonReentrant {
+        require(to != address(0), "Invalid address");
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No SCAI to withdraw");
+        to.transfer(balance);
+        emit StuckSCAIRecovered(to, balance);
+    }
+}
