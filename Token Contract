@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.27;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -39,7 +39,7 @@ contract NarraAI is ERC20, Ownable, ReentrancyGuard {
     IPancakeRouter public router;
     address public pair;
 
-    uint256 public marketingFee = 3; // 3% of every transfer goes to marketing
+    uint256 public marketingFee = 2; // 2% of every transfer goes to marketing
     uint256 public lpFee = 3;        // 3% goes to the contract (for liquidity)
     uint256 public swapThreshold = 1000 * 1e18; // Minimum token amount to trigger auto-liquidity
 
@@ -53,6 +53,7 @@ contract NarraAI is ERC20, Ownable, ReentrancyGuard {
     event LiquidityAdded(uint256 tokenAmount, uint256 scaiAmount);
     event FeesWithdrawn(address to, uint256 amount);
     event StuckSCAIRecovered(address to, uint256 amount);
+    event TokenInitialized(address indexed owner, address router, address pair);
 
     // Modifier to lock liquidity functions to avoid re-entrancy bugs
     modifier lockTheSwap() {
@@ -68,6 +69,8 @@ contract NarraAI is ERC20, Ownable, ReentrancyGuard {
         pair = IPancakeFactory(router.factory()).createPair(address(this), router.WETH());
 
         _approve(address(this), address(router), type(uint256).max);
+        
+        emit TokenInitialized(msg.sender, _router, pair);
     }
 
     receive() external payable {}
@@ -87,6 +90,7 @@ contract NarraAI is ERC20, Ownable, ReentrancyGuard {
 
     // Adjust the token threshold that triggers auto-liquidity
     function setSwapThreshold(uint256 _threshold) external onlyOwner {
+        require(_threshold >= 100 * 1e18, "Swap threshold too low");
         swapThreshold = _threshold;
         emit SwapThresholdUpdated(_threshold);
     }
@@ -130,7 +134,7 @@ contract NarraAI is ERC20, Ownable, ReentrancyGuard {
         path[0] = address(this);
         path[1] = router.WETH();
 
-        _approve(address(this), address(router), half);
+        _approve(address(this), address(router), tokens);
 
         // Swap half for SCAI
         router.swapExactTokensForETHSupportingFeeOnTransferTokens(
